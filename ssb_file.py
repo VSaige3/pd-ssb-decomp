@@ -61,6 +61,15 @@ def to_offset(block):
 def to_block(offset):
     return (offset - 0x20) // 4
 
+
+class SSBFunc:
+    def __init__(self, name="", bounds=(0, 0), numparams=-1, returns=False):
+        self.name = name
+        self.bounds = bounds
+        self.numparams = numparams
+        self.returns = returns
+
+
 class SSBDecompiler:
     VIRTUAL_SWITCH_START_VAL = (0x50,)
     VIRTUAL_SWITCH_DEFAULT_VAL = (0x51,)
@@ -122,8 +131,57 @@ class SSBDecompiler:
 
         return tokens
 
+    class VarSymbol:
+        # TODO: add more customization for symbols
+        # NOTE: never put the location on stack in here
+        def __init__(self, index, stack_pos, data=None):
+            self.start_index = index
+            self.stack_pos = stack_pos
+            self.data = data
+    
     @staticmethod
-    def str_token(token):
+    def create_lvar_binding(_json: list[dict]):
+        # each element in the list is a binding
+        binding = dict()
+        for elem in _json:
+            start_index = elem["start_index"]
+            stack_pos = elem["stack_pos"]
+            symbol_dat = elem["symbol_dat"]
+            binding.setdefault(start_index, []).append(SSBDecompiler.VarSymbol(start_index, stack_pos, symbol_dat))
+        return binding
+    
+    """
+    DOES NOT ACTUALLY CREATE JSON
+    """
+    @staticmethod
+    def create_json_from_binding(binding: dict[int, list[VarSymbol]]):
+        out = []
+        for indx in binding:
+            for symbol in binding[indx]:
+                out.append({"start_index": indx, "stack_pos": symbol.stack_pos, "symbol_dat": symbol.data})
+        return out
+
+    @staticmethod
+    def get_var_name(stackpos, stackvar_names: list[VarSymbol]):
+        max_st_index = -1
+        name = ""
+        for vsym in stackvar_names:
+            if vsym.stack_pos == stackpos and vsym.start_index > max_st_index:
+                max_st_index = vsym.start_index
+                name = vsym.data["name"]
+
+        if max_st_index != -1:
+            return name
+        elif stackpos >= 0:
+            return'param_{:x}'.format(stackpos)
+        else:
+            return 'local_{:x}'.format(-stackpos - 1)
+
+    # stackvar_names is a list of all currently applied symbols
+    @staticmethod
+    def str_token(token, stackvar_names: list[VarSymbol] = None, getfunction_callback = None):
+        if stackvar_names is None:
+            stackvar_names = []
         opcode = token[0]
         if opcode == 0x00:
             return 'nop'
@@ -132,7 +190,12 @@ class SSBDecompiler:
         elif opcode == 0x02:
             return 'throw {:02x}'.format(token[2])
         elif opcode == 0x03:
-            return 'call {:+04x} ({:02x} params)'.format(token[2], token[1])
+            if getfunction_callback is None:
+                return 'call {:+04x} ({:02x} params)'.format(token[2], token[1])
+            else:
+                f: SSBFunc = getfunction_callback(token[-1] + token[2] + 1)
+                return 'call {} ({:02x} params)'.format(f.name, token[1])
+                # COMECOME
         elif opcode == 0x04:
             return '0x04 {:04x}'.format(token[2])
         elif opcode == 0x05:
@@ -153,24 +216,18 @@ class SSBDecompiler:
             return 'case {:02x}: (else j {:+04x})'.format(token[1], token[2])
         elif opcode == 0x09:
             stackpos = token[2]
-            if stackpos >= 0:
-                fname = 'param_{:x}'.format(stackpos)
-            else:
-                fname = 'local_{:x}'.format(-stackpos)
+            fname = SSBDecompiler.get_var_name(stackpos, stackvar_names)
             return 'push stack[{:+04x}] ({})'.format(stackpos, fname)
         elif opcode == 0x0a:
             mod = token[1]
             if mod == 0:
                 cmdname = 'pop (set)'
             elif mod == 1:
-                cmdname = 'pop (inc)'
+                cmdname = 'pop (add)'
             else:
-                cmdname = 'pop (dec)'
+                cmdname = 'pop (sub)'
             stackpos = token[2]
-            if stackpos <= 0:
-                fname = 'param_{:x}'.format(-stackpos - 1)
-            else:
-                fname = 'local_{:x}'.format(stackpos)
+            fname = SSBDecompiler.get_var_name(stackpos, stackvar_names)
             return '{} stack[{:+04x}] ({})'.format(cmdname, stackpos, fname)
         elif opcode == 0x0d:
             return 'del {:04x}'.format(token[2])
@@ -202,8 +259,8 @@ class SSBDecompiler:
             else:
                 return 'mod (stack[0] % stack[-1])'
         elif opcode == 0x17:
-            R = ['==', '!=', '>', '<', '>=', '<=', 'hasflags'][token[1]]
-            if token[2] == 0:
+            R = ['==', '!=', '>', '<', '>=', '<=', 'hasflags'][token[2]]
+            if token[1] == 0:
                 return 'test (stack[-1] {} stack[0])'.format(R)
             else:
                 return 'test (stack[0] {} stack[-1])'.format(R)
@@ -535,6 +592,9 @@ class SSBFile:
         def __iter__(self):
             return self.hashtable.__iter__()
 
+        def pop(self, key):
+            return self.hashtable.pop(key)
+
     class SSBHeader:
         def __init__(self, bytes):
             unpacked = struct.unpack('<8I', bytes)
@@ -578,8 +638,8 @@ class SSBFile:
             if len(bytes_read) < 12 or offset >= end:
                 break
             ints = struct.unpack('<3I', bytes_read)
-            # convert to string: offset
-            functable.add(convert_int(ints[0]) + convert_int(ints[1]), (ints[2] - 8, ints[0:2]))
+            # convert to string: (offset of function, raw ints, offset of entry)
+            functable.add(convert_int(ints[0]) + convert_int(ints[1]), (ints[2] - 8, ints[0:2], offset))
             offset += 12
 
         return functable
@@ -593,21 +653,20 @@ class SSBFile:
 
         offset = header.strings_offset
         f.seek(offset, 0)
-        curr_str = ''
+        curr_str = b''
         strings = dict()
         start_offset = 0
 
         while True:
-            next_byte = f.read(1)
-            if len(next_byte) < 1 or offset >= end:
+            bytes_read = f.read(1)
+            if len(bytes_read) < 1 or offset >= end:
                 break
-            byte_int = int.from_bytes(next_byte)
-            if byte_int == 0:
+            next_byte = bytes_read[0]
+            curr_str += bytes_read
+            if next_byte == 0:
                 strings[start_offset] = curr_str
-                curr_str = ''
+                curr_str = b''
                 start_offset = offset - header.strings_offset + 1
-            else:
-                curr_str += chr(byte_int)
             offset += 1
         return strings
 
@@ -618,30 +677,112 @@ class SSBFile:
         f.seek(0, 2)  # seek end
         self.eof = f.tell()
         self.header = SSBFile.read_header(f)
-        print('closed')
         self.data = SSBFile.read_data(f, self.header)
         self.functable = SSBFile.read_functable(f, self.header)
         self.strings = SSBFile.read_strings(f, self.header, str_end)
+        self.var_symbols: dict[int, list[SSBDecompiler.VarSymbol]] = dict()   # Variable symbols. Need to be bound
+        self.raw_symbols = dict()   # all symbols associated with this ssb file
 
     def write_to_stream(self, stream):
+        # DOES NOT WORK
         # assume at start of stream
         stream.write(self.header.get_bytes())
         for packet in self.data:
             stream.write(struct.pack('<I', packet))
 
     def write_to_buffer(self, buffer: bytearray):
-        buffer[0:0x20] = self.header.get_bytes()
-        buffer[0x20:self.header.functable_offset] = self.data
+        header_bytes = self.header.get_bytes()
+        buffer[0:0x20] = header_bytes
+
+        for i in range(len(self.data)):
+            start = 0x20 + (i * 0x4)
+            buffer[start:start+0x4] = self.data[i].to_bytes(4, byteorder='little')
         pos = self.header.functable_offset
         for key in self.functable.hashtable:
             for val in self.functable.hashtable[key]:
-                buffer[pos:pos + 4] = val[0]
-                buffer[pos + 4:pos + 12] = val[1]
-                pos += 12
+                pos = val[2]
+                buffer[pos:pos + 12] = struct.pack('<3I', val[1][0], val[1][1], val[0] + 8)
 
         for offset in self.strings:
             s = self.strings[offset]
-            buffer[offset:offset + len(s)] = bytes()
+            r_offset = offset + self.header.strings_offset
+            buffer[r_offset:r_offset + len(s)] = s
+    """
+    takes in the raw json object from the symbol file and binds it
+    """
+    def bind_symbol_dict(self, symbols):
+        self.raw_symbols = symbols
+        self.rebind()
+
+    def rebind(self):
+        # NOTE: in the future we may want that bindings are more complex, so perhaps instead of a dictionary we use our own class?
+        # ALSO the idea is that we have {start line: {stack position: symbol}}
+        self.var_symbols = SSBDecompiler.create_lvar_binding(self.raw_symbols)
+    
+    def update_raw(self):
+        self.raw_symbols = SSBDecompiler.create_json_from_binding(self.var_symbols)
+
+    # allocating functions
+    """
+    start_instr: index of instruction you wish to allocate after. ie, if this is the end of a function you are creating a new one
+    """
+    def insert_instrs(self, data_size: int, start_instr: int = -1, data_to_ins: list = None):
+        # insert 0's into list
+        if data_size <= 0:
+            return  # nothing to do
+        if start_instr == -1 or start_instr > len(self.data):
+            start_instr = len(self.data)
+        if data_to_ins is None:
+            data_to_ins = [0] * data_size  # fill with 0s
+        for i in range(len(self.data)):
+            jmp_offset = get_jump_offset(self.data[i])
+            if jmp_offset is not None:
+                if 0 <= (start_instr - i) < jmp_offset:
+                    # if it jumps from before to after, add size
+                    print(f"old: {self.data[i]:08X}, size: {data_size}")
+                    new_data = set_jump_offset(self.data[i], jmp_offset - 1 + data_size)
+                    self.data[i] = new_data
+                    print(f"new: {new_data:08X}")
+                elif jmp_offset <= (start_instr - i) < 0:
+                    # decrease jump
+                    print(f"old: {self.data[i]:08X}, size: {data_size}")
+                    new_data = set_jump_offset(self.data[i], jmp_offset - 1 - data_size)
+                    self.data[i] = new_data
+                    print(f"new: {new_data:08X}")
+        # insert actual data
+        for a in data_to_ins:
+            self.data.insert(start_instr + 1, a)  # not correct, will reverse them
+        # update bound symbols
+        for obj in self.raw_symbols:
+            if obj["start_indx"] >= start_instr:
+                obj["start_indx"] = obj["start_indx"] + data_size
+        self.rebind()
+        # update the function table
+        for fun_name in self.functable:
+            if self.functable[fun_name][0] > start_instr:
+                self.functable[fun_name] = (self.functable[fun_name][0] + data_size,
+                                            self.functable[fun_name][1],
+                                            self.functable[fun_name][2] + data_size * 4)
+            else:
+                self.functable[fun_name] = (self.functable[fun_name][0],
+                                            self.functable[fun_name][1],
+                                            self.functable[fun_name][2] + data_size * 4)
+                # print(self.functable[fun_name])
+        # update the ftable and string offsets
+        self.header.functable_offset += data_size * 4
+        self.header.strings_offset += data_size * 4
+
+    def insert_functable_entry(self, fname, offset, table_indx: int = -1):
+        if table_indx == -1:
+            table_indx = len(self.functable)
+        table_offset = self.header.functable_offset + table_indx * 12
+        # push forward function table
+        for fun_name in self.functable:
+            if self.functable[fun_name][1] >= table_offset:
+                self.functable[fun_name] = (self.functable[fun_name][0],
+                                            self.functable[fun_name][1],
+                                            self.functable[fun_name][2] + 12)
+        self.functable[fname] = (offset, convert_str(fname), table_offset)
 
     def get_function_bounds(self, target):
         endindex = target
@@ -709,3 +850,31 @@ def to_signed(n, l):
 def to_signed_16(n):
     return n | (- (n & 0x8000))
 
+
+def set_jump_offset(cmd, new_offset):
+    opcode = (cmd & 0xff).to_bytes(1)
+    byte2 = ((cmd >> 0x8) & 0xff).to_bytes(1)
+    if new_offset > 0xffffff:
+        print('oops')
+        return cmd
+    if opcode == 0x1f:
+        return int.from_bytes(struct.pack("<ci", opcode, new_offset)[0:4], byteorder='little')
+    elif new_offset > 0xffff:
+        print('bad')
+        return cmd
+    else:
+        return int.from_bytes(struct.pack("<cch", opcode, byte2, new_offset), byteorder='little')
+
+
+def get_jump_offset(cmd):
+    opcode = cmd & 0xff
+    if opcode == 0x07:
+        # ujump
+        return to_signed_16(cmd >> 0x10) + 1
+    elif opcode == 0x03:
+        return to_signed_16(cmd >> 0x10) + 1
+    elif opcode == 0x08:
+        return to_signed_16(cmd >> 0x10) + 1
+    elif opcode == 0x1f:
+        return to_signed(cmd >> 8, 0x18) + 1
+    return None
